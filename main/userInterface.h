@@ -28,6 +28,7 @@
     use <mootor>           - vali, millist mootorit käsud edaspidi juhivad
     <mootor> <käsk> [arg]  - käsk ühele kindlale mootorile ilma valikut muutmata, nt 'dc speed 200'
     list                   - näita registreeritud mootoreid
+    rampcontroller <sek> <kiirus> - muuda kiirust sujuvalt, mitteblokeerivalt (vt cmdRampController)
 */
 class CommandInterpreter {
 public:
@@ -60,10 +61,25 @@ private:
     const char *description;  // Käsu enda kirjeldus
   };
 
+  // Kiiruse sujuv muutmine ('rampcontroller'): igal mootoril üks. Käsk salvestab ainult alg- ja
+  // lõppkiiruse ning kestuse, vahesammud teeb updateRamps().
+  struct Ramp {
+    bool active;
+    uint8_t startSpeed;
+    uint8_t targetSpeed;
+    unsigned long startMs;     // millis() ramp'i alguses
+    unsigned long durationMs;
+  };
+
   struct Entry {
     const char *name;
     Motor *motor;
+    Ramp ramp;
   };
+
+  // Pikim lubatud ramp sekundites. Piirang hoiab interpolatsiooni (255 * ms) 32-bitise long'i piires:
+  // 255 * 3 600 000 = 918 000 000 < 2 147 483 647.
+  static const long RAMP_MAX_SECONDS = 3600;
 
   static const Command commands[];
   static const size_t COMMAND_COUNT;
@@ -72,6 +88,7 @@ private:
   bool cmdStop(Motor &motor, const String &arg);
   bool cmdStopAll(Motor &motor, const String &arg);
   bool cmdSpeed(Motor &motor, const String &arg);
+  bool cmdRampController(Motor &motor, const String &arg);
   bool cmdDir(Motor &motor, const String &arg);
   bool cmdSteps(Motor &motor, const String &arg);
   bool cmdAngle(Motor &motor, const String &arg);
@@ -87,6 +104,9 @@ private:
   static void reportSet(Motor &motor);
   static void warnIfNoSpeed(Motor &motor);
   Entry *find(const String &name);
+  Ramp *rampOf(Motor &motor);
+  void cancelRamp(Motor &motor);
+  void updateRamps();
   void execute(const String &name, const String &arg, Motor *target);
 
   Entry motors[MAX_MOTORS];
@@ -103,6 +123,7 @@ const CommandInterpreter::Command CommandInterpreter::commands[] = {
   { "stop",  &CommandInterpreter::cmdStop,  ANY,            "stop",            "Stop the motor" },
   { "stopall", &CommandInterpreter::cmdStopAll, ANY,        "stopall",         "Stop all motors at once" },
   { "speed", &CommandInterpreter::cmdSpeed, DC | STEPPER,   "speed <0-255>",   "Set the speed, or just enter a number (not for servo)" },
+  { "rampcontroller", &CommandInterpreter::cmdRampController, DC | STEPPER, "rampcontroller <1-3600> <0-255>", "Change the speed gradually: <seconds> <target speed> (not for servo)" },
   { "dir",   &CommandInterpreter::cmdDir,   STEPPER,        "dir <cw|ccw>",    "Set stepper direction (stepper only)" },
   { "steps", &CommandInterpreter::cmdSteps, STEPPER,        "steps <1-65535>", "Move a number of steps, then stop (stepper only)" },
   { "angle", &CommandInterpreter::cmdAngle, STEPPER,        "angle <degrees>", "Turn by an angle, negative = counter-clockwise (stepper only)" },
@@ -125,6 +146,7 @@ bool CommandInterpreter::cmdStart(Motor &motor, const String &arg) {
 }
 
 bool CommandInterpreter::cmdStop(Motor &motor, const String &arg) {
+  cancelRamp(motor);
   motor.stop();
   Serial.println(F("Motor stopped."));
   return true;
@@ -133,6 +155,7 @@ bool CommandInterpreter::cmdStop(Motor &motor, const String &arg) {
 // Peatab kõik registreeritud mootorid, mitte ainult valitud mootori
 bool CommandInterpreter::cmdStopAll(Motor &motor, const String &arg) {
   for (uint8_t i = 0; i < motorCount; i++) {
+    motors[i].ramp.active = false;
     motors[i].motor->stop();
   }
   Serial.println(F("All motors stopped."));
@@ -202,9 +225,110 @@ void CommandInterpreter::warnIfNoSpeed(Motor &motor) {
 bool CommandInterpreter::cmdSpeed(Motor &motor, const String &arg) {
   long val;
   if (!parseInt(arg, 0, 255, val)) return false;
+  cancelRamp(motor);  // käsitsi seatud kiirus tühistab pooleli oleva ramp'i
   motor.setSpeed((uint8_t)val);
   reportSet(motor);
   return true;
+}
+
+/*
+  rampcontroller <sekundid> <sihtkiirus>: viib mootori kiiruse praegusest väärtusest sihtkiiruseni
+  lineaarselt <sekundid> jooksul (tõus ja langus töötavad ühtmoodi).
+
+  Käsk ise ei oota: see salvestab ainult alg- ja sihtkiiruse ning aja ning naaseb kohe. Vahesammud teeb
+  updateRamps(), mida poll() kutsub igal loop()-i läbimisel. Ootamine while/delay tsüklis ei sobi, sest
+  see peataks loop() ajaks Serial-i lugemise, teiste mootorite update()-i (samm-mootor jääks seisma) ja
+  wdt_reset()-i (watchdog taaskäivitaks plaadi 250 ms pärast).
+
+  Ramp lõpeb, kui sihtkiirus on käes, ning katkeb käskudega 'stop', 'stopall' ja 'speed' või kui
+  mootor ise peatub. Uus 'rampcontroller' alustab praegusest kiirusest, nii et kiirus ei hüppa.
+*/
+bool CommandInterpreter::cmdRampController(Motor &motor, const String &arg) {
+  String timeArg, speedArg;
+  splitWord(arg, timeArg, speedArg);
+
+  long seconds, target;
+  if (!parseInt(timeArg, 1, RAMP_MAX_SECONDS, seconds)) return false;
+  if (!parseInt(speedArg, 0, 255, target)) return false;
+
+  Ramp *ramp = rampOf(motor);
+  if (!ramp) return false;
+
+  // Peatatud mootori kiirust ei saa ramp'ida: 'start' nullib kiiruse niikuinii
+  if (!motor.isRunning()) {
+    Serial.println(F("Error: Motor is stopped, enter 'start' first."));
+    return true;
+  }
+
+  if (motor.getSpeed() == target) {
+    ramp->active = false;
+    Serial.print(F("Already at "));
+    printValue(motor);
+    Serial.println(F("."));
+    return true;
+  }
+
+  ramp->startSpeed = motor.getSpeed();
+  ramp->targetSpeed = (uint8_t)target;
+  ramp->startMs = millis();
+  ramp->durationMs = (unsigned long)seconds * 1000UL;
+  ramp->active = true;
+
+  Serial.print(F("Ramping speed "));
+  Serial.print(ramp->startSpeed);
+  Serial.print(F(" -> "));
+  Serial.print(ramp->targetSpeed);
+  Serial.print(F(" over "));
+  Serial.print(seconds);
+  Serial.println(F(" s."));
+  return true;
+}
+
+// Mootori ramp (nullptr, kui mootor pole registreeritud)
+CommandInterpreter::Ramp *CommandInterpreter::rampOf(Motor &motor) {
+  for (uint8_t i = 0; i < motorCount; i++) {
+    if (motors[i].motor == &motor) return &motors[i].ramp;
+  }
+  return nullptr;
+}
+
+void CommandInterpreter::cancelRamp(Motor &motor) {
+  if (Ramp *ramp = rampOf(motor)) ramp->active = false;
+}
+
+// Viib käimasolevad ramp'id edasi; kutsutakse poll()-ist, ei blokeeri.
+void CommandInterpreter::updateRamps() {
+  for (uint8_t i = 0; i < motorCount; i++) {
+    Ramp &ramp = motors[i].ramp;
+    if (!ramp.active) continue;
+    Motor &motor = *motors[i].motor;
+
+    // Peatunud mootori kiirust enam ei muudeta (nt samm-mootor lõpetas 'steps' liikumise)
+    if (!motor.isRunning()) {
+      ramp.active = false;
+      continue;
+    }
+
+    unsigned long elapsed = millis() - ramp.startMs;  // töötab ka millis() ületäitumisel
+    bool done = elapsed >= ramp.durationMs;
+    uint8_t speed;
+    if (done) {
+      speed = ramp.targetSpeed;
+    } else {
+      long delta = (long)ramp.targetSpeed - (long)ramp.startSpeed;
+      speed = (uint8_t)((long)ramp.startSpeed + delta * (long)elapsed / (long)ramp.durationMs);
+    }
+
+    // setSpeed ainult muutuse korral: samm-mootori apply() nullib sammu ajatempli
+    if (speed != motor.getSpeed()) motor.setSpeed(speed);
+
+    if (done) {
+      ramp.active = false;
+      Serial.print(F("Ramp done: "));
+      printValue(motor);
+      Serial.println();
+    }
+  }
 }
 
 // Käsud 'dir', 'steps', 'angle' ja 'pos' töötavad ainult oma tüübiga (vt käsutabel), seega asStepper()/asServo() pole siin nullptr.
@@ -285,7 +409,7 @@ bool CommandInterpreter::cmdList(Motor &motor, const String &arg) {
 
 bool CommandInterpreter::add(const char *name, Motor &motor) {
   if (motorCount >= MAX_MOTORS || find(name)) return false;
-  motors[motorCount++] = { name, &motor };
+  motors[motorCount++] = { name, &motor, {} };
   return true;
 }
 
@@ -357,6 +481,8 @@ void CommandInterpreter::poll() {
   static bool waitingForLineEnding = false;
 
   const unsigned long INPUT_TIMEOUT = 1000; // 1 second
+
+  updateRamps();
 
   while (Serial.available() > 0) {
     char c = Serial.read();

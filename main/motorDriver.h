@@ -264,7 +264,12 @@ void StepperMotor::update() {
     stepsPerSec = 1;
   unsigned long intervalUs = 1000000UL / stepsPerSec;
 
+  // Samm tehakse alles siis, kui eelmisest sammust on möödunud intervall; vahepeal naaseb update() kohe
   unsigned long now = micros();
+  if (now - lastStepUs < intervalUs) return;
+
+  // Kui ollakse üle ühe intervalli maha jäädud (nt pikk paus loop()-is), ei tehta mahajäänud samme
+  // korraga ära, vaid ajastus alustatakse uuesti; muidu liigutakse täpselt intervalli võrra edasi
   if (now - lastStepUs > 2 * intervalUs) lastStepUs = now;
   else lastStepUs += intervalUs;
 
