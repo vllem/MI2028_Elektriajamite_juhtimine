@@ -11,6 +11,8 @@
 
 // Single-header teegid (stb-stiilis, https://github.com/nothings/stb): teostus genereeritakse täpselt ühes failis. 
 // Mõtlesin, et suht mõtetu on jantida 4 erineva failiga ning tuli meelde, et single-header teegi moodi asi teeb elu lihtsamaks. 
+#include <avr/wdt.h>
+
 #define MOTORDRIVER_IMPLEMENTATION
 #define USERINTERFACE_IMPLEMENTATION
 #include "motorDriver.h"
@@ -35,9 +37,11 @@ void setup() {
   ui.add("servo", servo);
 
   Serial.println(F("Ready. Type 'help' to see available commands."));
+  wdt_enable(WDTO_250MS);
 }
 
 void loop() {
+  wdt_reset();
   ui.poll();
   stepper.update();
   dc.update();
