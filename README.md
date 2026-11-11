@@ -1,4 +1,4 @@
-# MI.2028 Elektriajamite juhtimine kursusetöö
+# MI.2028 Elektriajamite juhtimine
 
 - [main.ino](main/main.ino) on peamine fail, kuhu saab defineerida, mis mootoreid juhtida ning kuidas luua kommunikatsioon nendega
 
