@@ -22,13 +22,11 @@
   CommandInterpreter juhib ühte või mitut mootorit Serial-i käskudega.
   Mootorid registreeritakse nimega (add), nii et nende arv pole piiratud makroga ega ühe globaalse objektiga.
 
-  Kasutus:
-    start                  - käsk läheb valitud mootorile (esimesena lisatud mootor on vaikimisi valitud)
+  Kasutus: <mootor> <funktsioon> [parameeter], nt 'dc speed 255' või 'servo_1 pos 90'.
+  Üldkäsud ilma mootorita:
     stopall                - peata kõik registreeritud mootorid korraga
-    use <mootor>           - vali, millist mootorit käsud edaspidi juhivad
-    <mootor> <käsk> [arg]  - käsk ühele kindlale mootorile ilma valikut muutmata, nt 'dc speed 200'
     list                   - näita registreeritud mootoreid
-    rampcontroller <sek> <kiirus> - muuda kiirust sujuvalt, mitteblokeerivalt (vt cmdRampController)
+    help                   - näita käske
 */
 class CommandInterpreter {
 public:
@@ -50,7 +48,8 @@ private:
   typedef bool (CommandInterpreter::*Handler)(Motor &motor, const String &arg);
 
   // Mootoritüübid on bitid, et üks käsk saaks töötada mitmel tüübil (nt DC | STEPPER).
-  enum Kind : uint8_t { DC = 1, STEPPER = 2, SERVO = 4, ANY = DC | STEPPER | SERVO };
+  // GLOBAL (0) = üldkäsk, mis ei vaja mootorit (stopall, list, help); täidab runGlobal().
+  enum Kind : uint8_t { GLOBAL = 0, DC = 1, STEPPER = 2, SERVO = 4, ANY = DC | STEPPER | SERVO };
 
   //  Struct 'Command' paneb paika käskude struktuuri.
   struct Command {
@@ -86,16 +85,16 @@ private:
 
   bool cmdStart(Motor &motor, const String &arg);
   bool cmdStop(Motor &motor, const String &arg);
-  bool cmdStopAll(Motor &motor, const String &arg);
   bool cmdSpeed(Motor &motor, const String &arg);
   bool cmdRampController(Motor &motor, const String &arg);
   bool cmdDir(Motor &motor, const String &arg);
   bool cmdSteps(Motor &motor, const String &arg);
   bool cmdAngle(Motor &motor, const String &arg);
   bool cmdPos(Motor &motor, const String &arg);
-  bool cmdUse(Motor &motor, const String &arg);
-  bool cmdList(Motor &motor, const String &arg);
-  bool cmdHelp(Motor &motor, const String &arg);
+  void cmdStopAll();
+  void cmdList();
+  void cmdHelp();
+  bool runGlobal(const String &name);
 
   static bool parseInt(const String &s, long lo, long hi, long &out);
   static void splitWord(const String &line, String &word, String &rest);
@@ -107,30 +106,48 @@ private:
   Ramp *rampOf(Motor &motor);
   void cancelRamp(Motor &motor);
   void updateRamps();
-  void execute(const String &name, const String &arg, Motor *target);
+  void execute(const String &name, const String &arg, Motor &motor);
 
   Entry motors[MAX_MOTORS];
   uint8_t motorCount = 0;
-  uint8_t selected = 0;
   String inputLine;
 };
 
 #ifdef USERINTERFACE_IMPLEMENTATION
 
+#define FSTR(p) (reinterpret_cast<const __FlashStringHelper *>(p))
+
 // Kõik olemasolevad käsud massiivis (ehk arrays)
-const CommandInterpreter::Command CommandInterpreter::commands[] = {
-  { "start", &CommandInterpreter::cmdStart, ANY,            "start",           "Start the motor" },
-  { "stop",  &CommandInterpreter::cmdStop,  ANY,            "stop",            "Stop the motor" },
-  { "stopall", &CommandInterpreter::cmdStopAll, ANY,        "stopall",         "Stop all motors at once" },
-  { "speed", &CommandInterpreter::cmdSpeed, DC | STEPPER,   "speed <0-255>",   "Set the speed, or just enter a number (not for servo)" },
-  { "rampcontroller", &CommandInterpreter::cmdRampController, DC | STEPPER, "rampcontroller <1-3600> <0-255>", "Change the speed gradually: <seconds> <target speed> (not for servo)" },
-  { "dir",   &CommandInterpreter::cmdDir,   STEPPER,        "dir <cw|ccw>",    "Set stepper direction (stepper only)" },
-  { "steps", &CommandInterpreter::cmdSteps, STEPPER,        "steps <1-65535>", "Move a number of steps, then stop (stepper only)" },
-  { "angle", &CommandInterpreter::cmdAngle, STEPPER,        "angle <degrees>", "Turn by an angle, negative = counter-clockwise (stepper only)" },
-  { "pos",   &CommandInterpreter::cmdPos,   SERVO,          "pos <0-180>",     "Move to an angle in degrees (servo only)" },
-  { "use",   &CommandInterpreter::cmdUse,   ANY,            "use <motor>",     "Select the motor that the commands control" },
-  { "list",  &CommandInterpreter::cmdList,  ANY,            "list",            "Show all motors" },
-  { "help",  &CommandInterpreter::cmdHelp,  ANY,            "help",            "Show all commands" },
+// Tekstid on flash-mälus (PROGMEM), et need ei võtaks Uno 2 KB SRAM-i; tabel ise samuti
+#define CMD(var, name, usage, desc) \
+  static const char var##_n[] PROGMEM = name; \
+  static const char var##_u[] PROGMEM = usage; \
+  static const char var##_d[] PROGMEM = desc;
+CMD(c0, "start", "start", "Start the motor")
+CMD(c1, "stop", "stop", "Stop the motor")
+CMD(c2, "stopall", "stopall", "Stop all motors at once")
+CMD(c3, "speed", "speed <0-255>", "Set the speed (not for servo)")
+CMD(c4, "rampcontroller", "rampcontroller <1-3600> <0-255>", "Change the speed gradually: <seconds> <target speed> (not for servo)")
+CMD(c5, "dir", "dir <cw|ccw>", "Set stepper direction (stepper only)")
+CMD(c6, "steps", "steps <1-65535>", "Move a number of steps, then stop (stepper only)")
+CMD(c7, "angle", "angle <degrees>", "Turn by an angle, negative = counter-clockwise (stepper only)")
+CMD(c8, "pos", "pos <0-180>", "Move to an angle in degrees (servo only)")
+CMD(c10, "list", "list", "Show all motors")
+CMD(c11, "help", "help", "Show all commands")
+#undef CMD
+
+const CommandInterpreter::Command CommandInterpreter::commands[] PROGMEM = {
+  { c0_n, &CommandInterpreter::cmdStart, ANY, c0_u, c0_d },
+  { c1_n, &CommandInterpreter::cmdStop, ANY, c1_u, c1_d },
+  { c2_n, nullptr, GLOBAL, c2_u, c2_d },
+  { c3_n, &CommandInterpreter::cmdSpeed, DC | STEPPER, c3_u, c3_d },
+  { c4_n, &CommandInterpreter::cmdRampController, DC | STEPPER, c4_u, c4_d },
+  { c5_n, &CommandInterpreter::cmdDir, STEPPER, c5_u, c5_d },
+  { c6_n, &CommandInterpreter::cmdSteps, STEPPER, c6_u, c6_d },
+  { c7_n, &CommandInterpreter::cmdAngle, STEPPER, c7_u, c7_d },
+  { c8_n, &CommandInterpreter::cmdPos, SERVO, c8_u, c8_d },
+  { c10_n, nullptr, GLOBAL, c10_u, c10_d },
+  { c11_n, nullptr, GLOBAL, c11_u, c11_d },
 };
 
 const size_t CommandInterpreter::COMMAND_COUNT = sizeof(commands) / sizeof(commands[0]);
@@ -152,14 +169,13 @@ bool CommandInterpreter::cmdStop(Motor &motor, const String &arg) {
   return true;
 }
 
-// Peatab kõik registreeritud mootorid, mitte ainult valitud mootori
-bool CommandInterpreter::cmdStopAll(Motor &motor, const String &arg) {
+// Peatab kõik registreeritud mootorid
+void CommandInterpreter::cmdStopAll() {
   for (uint8_t i = 0; i < motorCount; i++) {
     motors[i].ramp.active = false;
     motors[i].motor->stop();
   }
   Serial.println(F("All motors stopped."));
-  return true;
 }
 
 /*
@@ -369,41 +385,39 @@ bool CommandInterpreter::cmdPos(Motor &motor, const String &arg) {
   return true;
 }
 
-bool CommandInterpreter::cmdHelp(Motor &motor, const String &arg) {
-  Serial.println(F("Commands:"));
+// Abitekstis on mootorikäskude ees '<motor>', üldkäskude ees mitte
+void CommandInterpreter::cmdHelp() {
+  Serial.println(F("Usage: <motor> <function> [parameter], e.g. 'dc speed 255'. Commands:"));
   for (size_t i = 0; i < COMMAND_COUNT; i++) {
-    Serial.print(F("  "));
-    Serial.print(commands[i].usage);
+    Command cmd;
+    memcpy_P(&cmd, &commands[i], sizeof cmd);
+    Serial.print(cmd.kinds == GLOBAL ? F("  ") : F("  <motor> "));
+    Serial.print(FSTR(cmd.usage));
     Serial.print(F(" - "));
-    Serial.println(commands[i].description);
+    Serial.println(FSTR(cmd.description));
   }
-  return true;
 }
 
-bool CommandInterpreter::cmdUse(Motor &motor, const String &arg) {
-  Entry *entry = find(arg);
-  if (!entry) {
-    Serial.println(F("Error: Unknown motor. Type 'list' to see motors."));
-    return true;
-  }
-  selected = entry - motors;
-  Serial.print(F("Selected motor: "));
-  Serial.println(entry->name);
-  return true;
-}
-
-bool CommandInterpreter::cmdList(Motor &motor, const String &arg) {
+void CommandInterpreter::cmdList() {
   Serial.println(F("Motors:"));
   for (uint8_t i = 0; i < motorCount; i++) {
     Motor &m = *motors[i].motor;
     Kind kind = kindOf(m);
-    Serial.print(i == selected ? F("* ") : F("  "));
+    Serial.print(F("  "));
     Serial.print(motors[i].name);
     Serial.print(kind == STEPPER ? F(" (stepper)") : kind == SERVO ? F(" (servo)") : F(" (DC)"));
     Serial.print(m.isRunning() ? F(", running, ") : F(", stopped, "));
     printValue(m);
     Serial.println();
   }
+}
+
+// Täidab üldkäsu, kui 'name' on üks neist; false, kui ei ole
+bool CommandInterpreter::runGlobal(const String &name) {
+  if (name.equalsIgnoreCase(F("stopall"))) cmdStopAll();
+  else if (name.equalsIgnoreCase(F("list"))) cmdList();
+  else if (name.equalsIgnoreCase(F("help"))) cmdHelp();
+  else return false;
   return true;
 }
 
@@ -420,60 +434,51 @@ CommandInterpreter::Entry *CommandInterpreter::find(const String &name) {
   return nullptr;
 }
 
-// Otsib käsu nime järgi ja täidab selle 'target' mootoril (nullptr = valitud mootor).
-void CommandInterpreter::execute(const String &name, const String &arg, Motor *target) {
+// Otsib funktsiooni nime järgi ja täidab selle mootoril 'motor'
+void CommandInterpreter::execute(const String &name, const String &arg, Motor &motor) {
   for (size_t i = 0; i < COMMAND_COUNT; i++) {
-    const Command &cmd = commands[i];
-    if (name.equalsIgnoreCase(cmd.name)) {
-      if (!target && motorCount == 0) {
-        // Käsufunktsioonid vajavad mootori viidet, seega ilma mootorita käske ei täideta
-        Serial.println(F("Error: No motors registered."));
-        return;
-      }
-      Motor &motor = target ? *target : *motors[selected].motor;
-      if (!(cmd.kinds & kindOf(motor))) {
-        Serial.print(F("Error: '"));
-        Serial.print(cmd.name);
-        Serial.println(F("' does not work with this type of motor."));
-      } else if (!(this->*cmd.handler)(motor, arg)) {
-        Serial.print(F("Error: Use '"));
-        Serial.print(cmd.usage);
-        Serial.println(F("'."));
-      }
-      return;
+    Command cmd;
+    memcpy_P(&cmd, &commands[i], sizeof cmd);
+    if (strcasecmp_P(name.c_str(), cmd.name) != 0) continue;
+    if (!(cmd.kinds & kindOf(motor))) {
+      Serial.print(F("Error: '"));
+      Serial.print(FSTR(cmd.name));
+      Serial.println(F("' does not work with this type of motor."));
+    } else if (!(this->*cmd.handler)(motor, arg)) {
+      Serial.print(F("Error: Use '<motor> "));
+      Serial.print(FSTR(cmd.usage));
+      Serial.println(F("'."));
     }
+    return;
   }
-  Serial.println(F("Unknown command! Type 'help' to see available commands."));
+  Serial.println(F("Unknown function! Type 'help' to see available commands."));
 }
 
+// Sisendrida: <mootor> <funktsioon> [parameeter] või üldkäsk (stopall, list, help)
 void CommandInterpreter::handle(String input) {
   input.trim();
   if (input.length() == 0) return;
 
-  if (isDigit(input[0])) {
-    execute("speed", input, nullptr);
-    return;
-  }
-
-  // Sisendrida jagatakse sõnadeks: [mootor] käsk [argument]
   String first, rest;
   splitWord(input, first, rest);
 
+  if (runGlobal(first)) return;
+
   Entry *entry = find(first);
   if (!entry) {
-    execute(first, rest, nullptr);
+    Serial.println(F("Error: Unknown motor. Type 'list' to see motors."));
     return;
   }
 
-  // Esimene sõna oli mootori nimi: järgmine sõna on käsk
   String name, arg;
   splitWord(rest, name, arg);
   if (name.length() == 0) {
-    Serial.println(F("Error: Use '<motor> <command>', e.g. 'dc speed 200'."));
+    Serial.println(F("Error: Use '<motor> <function> [parameter]', e.g. 'dc speed 255'."));
     return;
   }
-  execute(name, arg, entry->motor);
+  execute(name, arg, *entry->motor);
 }
+
 //Tuvastab \n ja \r reavahetus lõppe
 
 void CommandInterpreter::poll() {
@@ -507,9 +512,7 @@ void CommandInterpreter::poll() {
   if (waitingForLineEnding &&
       millis() - lastCharTime >= INPUT_TIMEOUT) {
 
-    Serial.println(
-      "No line ending detected. Executing command after 1 second of inactivity."
-    );
+    Serial.println(F("No line ending detected. Executing command after 1 second of inactivity."));
 
     handle(inputLine);
     inputLine = "";

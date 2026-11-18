@@ -311,7 +311,8 @@ void StepperMotor::moveAngle(int32_t degrees) {
     return;
   uint32_t absDeg = degrees < 0 ? -degrees : degrees;
   setDirection(degrees > 0);
-  moveSteps(((uint64_t)absDeg * STEPPER_STEPS_PER_REV + 180) / 360);
+  // 32 bitti piisab (|deg| <= 9999), 64-bitine jagamine oleks Uno-l suur
+  moveSteps(((uint32_t)absDeg * STEPPER_STEPS_PER_REV + 180) / 360);
 }
 
 /*
